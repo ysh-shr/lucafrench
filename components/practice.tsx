@@ -1,104 +1,143 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { questions } from "@/data/questions";
+import { conversations, type Conversation } from "@/data/questions";
 import { evaluate, type AnswerFeedback } from "@/lib/evaluate";
+import { canRecord, playSpeech, prefetchSpeech, startRecording, stopSpeech, unlockAudio, type Recording } from "@/lib/voice-client";
 
 type AppMode = "menu" | "practice" | "sequence";
 type SequencePhase = "question" | "answer";
+type VoiceEngine = "openai" | "browser";
+
+const QUESTION_RATE = 0.78;
+const ANSWER_RATE = 0.72;
+const wait = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 
 export function Practice() {
   const [mode, setMode] = useState<AppMode>("menu");
+  const [conversation, setConversation] = useState<Conversation | null>(null);
   const [questionIndex, setQuestionIndex] = useState(0);
   const [answer, setAnswer] = useState("");
   const [feedback, setFeedback] = useState<AnswerFeedback | null>(null);
   const [showTranslation, setShowTranslation] = useState(false);
   const [showModelAnswer, setShowModelAnswer] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
   const [speechSupported, setSpeechSupported] = useState<boolean | null>(null);
+  const [voice, setVoice] = useState<VoiceEngine>("browser");
   const [error, setError] = useState<string | null>(null);
   const [sequencePhase, setSequencePhase] = useState<SequencePhase>("question");
   const [sequencePlaying, setSequencePlaying] = useState(false);
   const [sequenceComplete, setSequenceComplete] = useState(false);
   const recognitionRef = useRef<SpeechRecognition | null>(null);
+  const recordingRef = useRef<Recording | null>(null);
+  const recordingTokenRef = useRef(0);
   const sequenceRunRef = useRef(0);
+  const questions = conversation?.questions ?? [];
   const question = questions[questionIndex];
 
   useEffect(() => {
-    setSpeechSupported(Boolean(window.SpeechRecognition || window.webkitSpeechRecognition));
+    const browserRecognition = Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
+    setSpeechSupported(browserRecognition);
+    let active = true;
+    fetch("/api/voice-status")
+      .then((response) => (response.ok ? response.json() : { enabled: false }))
+      .then((status: { enabled?: boolean }) => {
+        if (!active || !status.enabled) return;
+        setVoice("openai");
+        setSpeechSupported(canRecord() || browserRecognition);
+      })
+      .catch(() => undefined);
     return () => {
+      active = false;
       sequenceRunRef.current += 1;
-      recognitionRef.current?.abort();
-      window.speechSynthesis?.cancel();
+      cancelRecording();
+      stopAllSpeech();
     };
   }, []);
+
+  function stopAllSpeech() {
+    stopSpeech();
+    window.speechSynthesis?.cancel();
+  }
 
   function makeUtterance(text: string, rate: number) {
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = "fr-FR";
     utterance.rate = rate;
-    const frenchVoice = window.speechSynthesis.getVoices().find((voice) => voice.lang === "fr-FR");
+    const frenchVoice = window.speechSynthesis.getVoices().find((item) => item.lang === "fr-FR");
     if (frenchVoice) utterance.voice = frenchVoice;
     return utterance;
   }
 
-  function speak(text: string, rate = 0.78) {
-    if (!("speechSynthesis" in window)) {
-      setError("La lecture audio n’est pas disponible dans ce navigateur.");
-      return;
-    }
-    window.speechSynthesis.cancel();
-    window.speechSynthesis.speak(makeUtterance(text, rate));
+  /** Browser speech as a promise. Stays pending if cancelled; callers check their run id. */
+  function sayWithBrowser(text: string, rate: number): Promise<void> {
+    if (!("speechSynthesis" in window)) return Promise.reject(new Error("no speech synthesis"));
+    return new Promise((resolve, reject) => {
+      const utterance = makeUtterance(text, rate);
+      utterance.onend = () => resolve();
+      utterance.onerror = (event) => {
+        if (event.error !== "interrupted" && event.error !== "canceled") reject(new Error(event.error));
+      };
+      window.speechSynthesis.speak(utterance);
+    });
   }
 
-  function playSequenceItem(index: number, run: number) {
-    if (sequenceRunRef.current !== run) return;
+  /** Speaks with OpenAI when configured, falling back to the browser voice on any failure. */
+  async function say(text: string, rate: number): Promise<void> {
+    if (voice === "openai") {
+      try {
+        await playSpeech(text, rate < 0.75);
+        return;
+      } catch {
+        // fall through to the browser voice
+      }
+    }
+    await sayWithBrowser(text, rate);
+  }
 
-    const item = questions[index];
-    setQuestionIndex(index);
-    setSequencePhase("question");
+  function speak(text: string, rate = QUESTION_RATE) {
+    unlockAudio();
+    stopAllSpeech();
+    say(text, rate).catch(() => setError("La lecture audio n’est pas disponible dans ce navigateur."));
+  }
 
-    const questionUtterance = makeUtterance(item.french, 0.78);
-    questionUtterance.onerror = (event) => {
-      if (sequenceRunRef.current !== run || event.error === "interrupted" || event.error === "canceled") return;
+  async function runSequence(run: number) {
+    const isCurrent = () => sequenceRunRef.current === run;
+    try {
+      for (let index = 0; index < questions.length; index += 1) {
+        if (!isCurrent()) return;
+        const item = questions[index];
+        setQuestionIndex(index);
+        setSequencePhase("question");
+        if (voice === "openai") prefetchSpeech(item.examples[0], true);
+
+        await say(item.french, QUESTION_RATE);
+        if (!isCurrent()) return;
+        setSequencePhase("answer");
+        await wait(450);
+        if (!isCurrent()) return;
+
+        const next = questions[index + 1];
+        if (voice === "openai" && next) prefetchSpeech(next.french);
+        await say(item.examples[0], ANSWER_RATE);
+        if (!isCurrent()) return;
+        if (next) await wait(1500);
+      }
+      if (!isCurrent()) return;
+      setSequencePlaying(false);
+      setSequenceComplete(true);
+    } catch {
+      if (!isCurrent()) return;
       setSequencePlaying(false);
       setError("La lecture audio a été interrompue. Réessaie ou retourne au menu.");
-    };
-    questionUtterance.onend = () => {
-      if (sequenceRunRef.current !== run) return;
-      setSequencePhase("answer");
-
-      window.setTimeout(() => {
-        if (sequenceRunRef.current !== run) return;
-        const answerUtterance = makeUtterance(item.examples[0], 0.72);
-        answerUtterance.onerror = (event) => {
-          if (sequenceRunRef.current !== run || event.error === "interrupted" || event.error === "canceled") return;
-          setSequencePlaying(false);
-          setError("La lecture audio a été interrompue. Réessaie ou retourne au menu.");
-        };
-        answerUtterance.onend = () => {
-          if (sequenceRunRef.current !== run) return;
-          if (index === questions.length - 1) {
-            setSequencePlaying(false);
-            setSequenceComplete(true);
-            return;
-          }
-          window.setTimeout(() => playSequenceItem(index + 1, run), 1500);
-        };
-        window.speechSynthesis.speak(answerUtterance);
-      }, 450);
-    };
-    window.speechSynthesis.speak(questionUtterance);
+    }
   }
 
   function startSequence() {
-    recognitionRef.current?.abort();
-    if (!("speechSynthesis" in window)) {
-      setError("La lecture audio n’est pas disponible dans ce navigateur.");
-      return;
-    }
-
-    window.speechSynthesis.cancel();
+    unlockAudio();
+    cancelRecording();
+    stopAllSpeech();
     const run = sequenceRunRef.current + 1;
     sequenceRunRef.current = run;
     setMode("sequence");
@@ -107,45 +146,81 @@ export function Practice() {
     setSequencePlaying(true);
     setSequenceComplete(false);
     setError(null);
-    playSequenceItem(0, run);
+    void runSequence(run);
   }
 
   function startPractice() {
     sequenceRunRef.current += 1;
-    window.speechSynthesis?.cancel();
+    stopAllSpeech();
     setMode("practice");
     moveTo(0);
   }
 
   function returnToMenu() {
     sequenceRunRef.current += 1;
-    recognitionRef.current?.abort();
-    window.speechSynthesis?.cancel();
+    cancelRecording();
+    stopAllSpeech();
     setMode("menu");
     setQuestionIndex(0);
     setAnswer("");
     setFeedback(null);
     setShowTranslation(false);
     setShowModelAnswer(false);
-    setIsRecording(false);
     setSequencePlaying(false);
     setSequenceComplete(false);
     setError(null);
   }
 
-  function toggleRecording() {
-    if (isRecording) {
-      recognitionRef.current?.stop();
+  /** Stops any recording and discards its result. */
+  function cancelRecording() {
+    recordingTokenRef.current += 1;
+    recognitionRef.current?.abort();
+    recordingRef.current?.stop();
+    recordingRef.current = null;
+    setIsRecording(false);
+    setIsTranscribing(false);
+  }
+
+  async function recordWithOpenAi() {
+    const token = recordingTokenRef.current + 1;
+    recordingTokenRef.current = token;
+    let recording: Recording;
+    try {
+      recording = await startRecording();
+    } catch {
+      setError("Le micro n’a pas fonctionné. Vérifie l’autorisation ou écris ta réponse.");
       return;
     }
+    if (recordingTokenRef.current !== token) {
+      recording.stop();
+      return;
+    }
+    recordingRef.current = recording;
+    setIsRecording(true);
+    recording.result
+      .then((text) => {
+        if (recordingTokenRef.current !== token) return;
+        if (text) setAnswer(text);
+        else setError("Je n’ai rien entendu. Réessaie ou écris ta réponse.");
+      })
+      .catch(() => {
+        if (recordingTokenRef.current === token) setError("La transcription n’a pas fonctionné. Réessaie ou écris ta réponse.");
+      })
+      .finally(() => {
+        if (recordingTokenRef.current !== token) return;
+        recordingRef.current = null;
+        setIsRecording(false);
+        setIsTranscribing(false);
+      });
+  }
 
+  function recordWithBrowser() {
     const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!Recognition) {
       setError("La reconnaissance vocale n’est pas disponible ici. Écris ta réponse ci-dessous.");
       return;
     }
 
-    window.speechSynthesis.cancel();
     const recognition = new Recognition();
     recognition.lang = "fr-FR";
     recognition.continuous = false;
@@ -165,8 +240,6 @@ export function Practice() {
     };
     recognition.onend = () => setIsRecording(false);
     recognitionRef.current = recognition;
-    setFeedback(null);
-    setError(null);
     try {
       recognition.start();
       setIsRecording(true);
@@ -176,21 +249,39 @@ export function Practice() {
     }
   }
 
+  function toggleRecording() {
+    if (isTranscribing) return;
+    if (isRecording) {
+      if (recordingRef.current) {
+        setIsTranscribing(true);
+        recordingRef.current.stop();
+      } else {
+        recognitionRef.current?.stop();
+      }
+      return;
+    }
+
+    stopAllSpeech();
+    setFeedback(null);
+    setError(null);
+    if (voice === "openai" && canRecord()) void recordWithOpenAi();
+    else recordWithBrowser();
+  }
+
   function checkAnswer() {
-    recognitionRef.current?.stop();
+    cancelRecording();
     setFeedback(evaluate(answer, question));
     setShowModelAnswer(false);
   }
 
   function moveTo(index: number) {
-    recognitionRef.current?.abort();
-    window.speechSynthesis?.cancel();
+    cancelRecording();
+    stopAllSpeech();
     setQuestionIndex(index);
     setAnswer("");
     setFeedback(null);
     setShowTranslation(false);
     setShowModelAnswer(false);
-    setIsRecording(false);
     setError(null);
   }
 
@@ -198,7 +289,10 @@ export function Practice() {
     <main>
       <section className="app-shell" aria-label="Exercice de conversation française">
         <header className={`header ${mode === "menu" ? "menu-header" : ""}`}>
-          <div className="brand"><span aria-hidden="true">◉</span> Parle avec moi</div>
+          <div className="brand">
+            <span aria-hidden="true">◉</span> Parle avec moi
+            {mode !== "menu" && conversation && <small className="brand-topic"> · {conversation.title}</small>}
+          </div>
           {mode !== "menu" && (
             <>
               <span className="counter">{questionIndex + 1} / {questions.length}</span>
@@ -209,9 +303,30 @@ export function Practice() {
           )}
         </header>
 
-        {mode === "menu" && (
+        {mode === "menu" && !conversation && (
           <section className="card menu-card">
-            <span className="eyebrow">CHOISIS TON MODE</span>
+            <span className="eyebrow">CHOISIS TA CONVERSATION</span>
+            <h1>De quoi veux-tu parler ?</h1>
+            <p className="menu-intro">Choisis une conversation à pratiquer.</p>
+            <div className="mode-options">
+              {conversations.map((item) => (
+                <button key={item.id} className="mode-option" onClick={() => setConversation(item)}>
+                  <span className="mode-icon" aria-hidden="true">{item.icon}</span>
+                  <span>
+                    <strong>{item.title}</strong>
+                    <small>{item.subtitle} · {item.questions.length} questions</small>
+                  </span>
+                  <span className="mode-arrow" aria-hidden="true">→</span>
+                </button>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {mode === "menu" && conversation && (
+          <section className="card menu-card">
+            <button className="text-button back-link" onClick={() => { setConversation(null); setError(null); }}>← Changer de conversation</button>
+            <span className="eyebrow">{conversation.icon} {conversation.title.toUpperCase()} · CHOISIS TON MODE</span>
             <h1>Comment veux-tu pratiquer ?</h1>
             <p className="menu-intro">Réponds toi-même ou écoute toutes les questions avec un exemple de réponse.</p>
             <div className="mode-options">
@@ -295,17 +410,17 @@ export function Practice() {
               <section className="card response-card">
                 <div className="response-top">
                   {speechSupported !== false && (
-                    <button className={`record-button ${isRecording ? "recording" : ""}`} onClick={toggleRecording} aria-label={isRecording ? "Arrêter l’enregistrement" : "Commencer l’enregistrement"}>
+                    <button className={`record-button ${isRecording && !isTranscribing ? "recording" : ""}`} onClick={toggleRecording} disabled={isTranscribing} aria-label={isRecording ? "Arrêter l’enregistrement" : "Commencer l’enregistrement"}>
                       <span aria-hidden="true">{isRecording ? "■" : "●"}</span>
                     </button>
                   )}
                   <div>
-                    <h2>{isRecording ? "Je t’écoute…" : "À toi de répondre"}</h2>
+                    <h2>{isTranscribing ? "Je transcris…" : isRecording ? "Je t’écoute…" : "À toi de répondre"}</h2>
                     <p>{speechSupported === false ? "Écris ta réponse en français." : "Utilise le micro ou écris ta réponse."}</p>
                   </div>
                 </div>
                 <label htmlFor="answer">Ta réponse</label>
-                <textarea id="answer" value={answer} onChange={(event) => setAnswer(event.target.value)} placeholder="Je m’appelle…" rows={3} autoCapitalize="sentences" />
+                <textarea id="answer" value={answer} onChange={(event) => setAnswer(event.target.value)} placeholder={conversation?.placeholder} rows={3} autoCapitalize="sentences" />
                 <button className="button primary" onClick={checkAnswer} disabled={!answer.trim()}>Vérifier ma réponse</button>
                 {error && <p className="error" role="alert">⚠ {error}</p>}
               </section>

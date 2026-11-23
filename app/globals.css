@@ -36,6 +36,8 @@ main {
 .header.menu-header { grid-template-columns: 1fr; }
 .brand { color: var(--primary); font-size: 1.15rem; font-weight: 800; letter-spacing: -0.02em; }
 .brand span { display: inline-grid; place-items: center; width: 1.5rem; height: 1.5rem; border-radius: 50%; color: white; background: var(--primary); font-size: 0.7rem; }
+.brand-topic { color: var(--muted); font-size: 0.95rem; font-weight: 700; }
+.back-link { display: block; margin-bottom: 14px; }
 .counter { color: var(--muted); font-weight: 700; }
 .progress { grid-column: 1 / -1; height: 7px; border-radius: 999px; overflow: hidden; background: #dedbeb; }
 .progress span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #665bea, #8b6df2); transition: width 240ms ease; }
